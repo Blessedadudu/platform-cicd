@@ -79,27 +79,16 @@ resource "google_project_service" "secretmanager" {
 # IMPORTANT: `location_id` CANNOT be changed after creation.
 # The region you set here is permanent for this project.
 #
-# IMPORT STRATEGY:
-#   If App Engine already exists in this project (common for shared/existing
-#   projects), Terraform would fail with a 409 "already exists" error.
-#   The `import` block tells Terraform to adopt the existing resource into
-#   state rather than trying to create it.
-
-import {
-  id = var.gcp_project_id
-  to = google_app_engine_application.app
-}
+# NOTE: If App Engine already exists in this project, the workflow runs
+# `terraform import` before plan/apply to adopt it into state.
 
 resource "google_app_engine_application" "app" {
   project     = var.gcp_project_id
   location_id = var.region
 
-  # App Engine applications cannot be deleted once created.
-  # This lifecycle block makes that explicit in Terraform.
   lifecycle {
     prevent_destroy = true
-    # Ignore changes to location_id since it can't be changed after creation
-    ignore_changes = [location_id]
+    ignore_changes  = [location_id]
   }
 
   depends_on = [google_project_service.appengine]

@@ -184,6 +184,15 @@ jobs:
         working-directory: terraform
         run: terraform validate
 
+      - name: Import existing App Engine (if any)
+        if: needs.validate.outputs.platform == 'appengine'
+        working-directory: terraform
+        run: |
+          terraform import \
+            'module.appengine[0].google_app_engine_application.app' \
+            '${{ needs.validate.outputs.gcp_project_id }}' 2>/dev/null || true
+        continue-on-error: true
+
       - name: Terraform Plan
         id: plan
         working-directory: terraform
@@ -286,6 +295,15 @@ jobs:
           terraform init \
             -backend-config="bucket=${{ secrets.TERRAFORM_STATE_BUCKET }}" \
             -backend-config="prefix=${{ needs.validate.outputs.service_name }}/${{ inputs.environment }}"
+
+      - name: Import existing App Engine (if any)
+        if: needs.validate.outputs.platform == 'appengine'
+        working-directory: terraform
+        run: |
+          terraform import \
+            'module.appengine[0].google_app_engine_application.app' \
+            '${{ needs.validate.outputs.gcp_project_id }}' 2>/dev/null || true
+        continue-on-error: true
 
       - name: Download plan
         uses: actions/download-artifact@v4
