@@ -1,0 +1,66 @@
+{
+  "$schema": "../schema.json",
+  "service": {
+    "name": "api-gateway",
+    "team": "platform",
+    "repository": "org/api-gateway"
+  },
+  "target": {
+    "platform": "compute-mig",
+    "gcp_project_id": "myorg-staging",
+    "region": "us-central1"
+  },
+  "environments": {
+    "staging": {
+      "gcp_project_id": "myorg-staging",
+      "variables": {
+        "NODE_ENV": "staging",
+        "LOG_LEVEL": "debug"
+      }
+    },
+    "production": {
+      "gcp_project_id": "myorg-production",
+      "variables": {
+        "NODE_ENV": "production",
+        "LOG_LEVEL": "warn"
+      },
+      "requires_approval": true
+    }
+  },
+  "build": {
+    "runtime": "nodejs22",
+    "build_command": "npm run build",
+    "artifact_path": "./dist"
+  },
+  "deploy": {
+    "health_check_path": "/health",
+    "min_instances": 2,
+    "max_instances": 20,
+    "timeout_seconds": 600
+  },
+  "platform_config": {
+    "machine_type": "e2-standard-2",
+    "disk_size_gb": 30,
+    "image_family": "ubuntu-2204-lts",
+    "image_project": "ubuntu-os-cloud",
+    "instance_template_name_prefix": "api-gw-tmpl",
+    "health_check": {
+      "check_interval_sec": 10,
+      "timeout_sec": 5,
+      "healthy_threshold": 2,
+      "unhealthy_threshold": 3,
+      "port": 8080,
+      "request_path": "/health"
+    },
+    "autoscaler": {
+      "min_replicas": 2,
+      "max_replicas": 20,
+      "cpu_target": 0.65,
+      "cooldown_period": 90
+    },
+    "named_port": {
+      "name": "http",
+      "port": 8080
+    }
+  }
+}

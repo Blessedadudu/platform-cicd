@@ -1,0 +1,517 @@
+################################################################################
+# deploy.yml — The Reusable Deployment Workflow
+#
+# This is THE single workflow that all services call. It:
+#   1. Validates the deploy.json config
+#   2. Resolves environment-specific overrides
+#   3. Runs Terraform plan (and posts to PR)
+#   4. Runs Terraform apply (creates infra if absent)
+#   5. Deploys the application (platform-specific)
+#   6. Runs post-deployment healthcheck
+#
+# USAGE (from a caller workflow):
+#   jobs:
+#     deploy:
+#       uses: org/cicd/.github/workflows/deploy.yml@main
+#       with:
+#         config_path: ./deploy.json
+#         environment: staging
+#       secrets: inherit
+#
+# DESIGN DECISIONS:
+#   - Reusable workflow (not composite action) for multi-job + env gates
+#   - GCP Service Account JSON key for authentication
+#   - Terraform state isolated per service + environment
+#   - Plan output posted as PR comment for review
+################################################################################
+
+name: "Deploy Service"
+
+on:
+  workflow_call:
+    inputs:
+      config_path:
+        description: "Path to the deploy.json config file"
+        required: true
+        type: string
+        default: "./deploy.json"
+
+      environment:
+        description: "Target environment (staging, production)"
+        required: true
+        type: string
+
+      terraform_version:
+        description: "Terraform version to use"
+        required: false
+        type: string
+        default: "1.9.0"
+
+      auto_approve:
+        description: "Auto-approve Terraform apply (should be false for production)"
+        required: false
+        type: boolean
+        default: false
+
+      cicd_ref:
+        description: "Git ref of the cicd repo to use (branch, tag, or SHA)"
+        required: false
+        type: string
+        default: "main"
+
+    secrets:
+      GCP_SA_KEY:
+        description: "GCP Service Account JSON key (base64 encoded or raw JSON)"
+        required: true
+      TERRAFORM_STATE_BUCKET:
+        description: "GCS bucket name for Terraform state"
+        required: true
+
+# ─── Concurrency Control ────────────────────────────────────────────────────
+# WHY: Prevent concurrent deployments to the same service + environment.
+# This avoids Terraform state lock conflicts and deployment races.
+
+concurrency:
+  group: "deploy-${{ inputs.environment }}-${{ github.repository }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write  # Required for PR comments (plan output)
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Job 1: Validate Configuration
+  # ═══════════════════════════════════════════════════════════════════════════
+  validate:
+    name: "Validate Config"
+    runs-on: ubuntu-latest
+    outputs:
+      service_name: ${{ steps.parse.outputs.service_name }}
+      team: ${{ steps.parse.outputs.team }}
+      platform: ${{ steps.parse.outputs.platform }}
+      gcp_project_id: ${{ steps.parse.outputs.gcp_project_id }}
+      region: ${{ steps.parse.outputs.region }}
+      runtime: ${{ steps.parse.outputs.runtime }}
+      resolved_config: ${{ steps.resolve.outputs.config }}
+
+    steps:
+      - name: Checkout service repo
+        uses: actions/checkout@v4
+
+      - name: Checkout CI/CD repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/cicd
+          ref: ${{ inputs.cicd_ref }}
+          path: .cicd
+
+      - name: Validate deploy.json
+        run: |
+          chmod +x .cicd/scripts/validate-config.sh
+          .cicd/scripts/validate-config.sh "${{ inputs.config_path }}"
+
+      - name: Parse config values
+        id: parse
+        run: |
+          CONFIG="${{ inputs.config_path }}"
+          echo "service_name=$(jq -r '.service.name' $CONFIG)" >> $GITHUB_OUTPUT
+          echo "team=$(jq -r '.service.team' $CONFIG)" >> $GITHUB_OUTPUT
+          echo "platform=$(jq -r '.target.platform' $CONFIG)" >> $GITHUB_OUTPUT
+          echo "gcp_project_id=$(jq -r '.target.gcp_project_id' $CONFIG)" >> $GITHUB_OUTPUT
+          echo "region=$(jq -r '.target.region' $CONFIG)" >> $GITHUB_OUTPUT
+          echo "runtime=$(jq -r '.build.runtime' $CONFIG)" >> $GITHUB_OUTPUT
+
+      - name: Resolve environment overrides
+        id: resolve
+        run: |
+          chmod +x .cicd/scripts/resolve-env.sh
+          RESOLVED=$(.cicd/scripts/resolve-env.sh "${{ inputs.config_path }}" "${{ inputs.environment }}")
+          # Store as multiline output
+          echo "config<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESOLVED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Job 2: Terraform Plan
+  # ═══════════════════════════════════════════════════════════════════════════
+  plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    needs: validate
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exitcode }}
+
+    steps:
+      - name: Checkout CI/CD repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/cicd
+          ref: ${{ inputs.cicd_ref }}
+
+      - name: Authenticate to GCP
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Write resolved config to tfvars
+        run: |
+          cat <<'EOF' > terraform/resolved.auto.tfvars.json
+          ${{ needs.validate.outputs.resolved_config }}
+          EOF
+
+      - name: Terraform Init
+        id: init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="prefix=${{ needs.validate.outputs.service_name }}/${{ inputs.environment }}"
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -detailed-exitcode \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan_output.txt', 'utf8');
+            const maxLength = 60000;  // GitHub comment limit is 65536
+            const truncated = plan.length > maxLength
+              ? plan.substring(0, maxLength) + '\n\n... (truncated)'
+              : plan;
+
+            const body = `## Terraform Plan — \`${{ needs.validate.outputs.service_name }}\` → \`${{ inputs.environment }}\`
+
+            **Platform:** \`${{ needs.validate.outputs.platform }}\`
+            **Project:** \`${{ needs.validate.outputs.gcp_project_id }}\`
+            **Region:** \`${{ needs.validate.outputs.region }}\`
+
+            <details>
+            <summary>Show Plan Output</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            </details>
+
+            *Plan exit code: \`${{ steps.plan.outputs.exitcode }}\`*
+            - \`0\` = No changes
+            - \`1\` = Error
+            - \`2\` = Changes pending`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Save plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: terraform/tfplan
+          retention-days: 5
+
+      - name: Check plan result
+        if: steps.plan.outputs.exitcode == '1'
+        run: |
+          echo "::error::Terraform plan failed"
+          exit 1
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Job 3: Terraform Apply
+  # ═══════════════════════════════════════════════════════════════════════════
+  apply:
+    name: "Terraform Apply"
+    runs-on: ubuntu-latest
+    needs: [validate, plan]
+    # Only apply if plan detected changes (exit code 2)
+    if: needs.plan.outputs.plan_exit_code == '2'
+    environment:
+      name: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout CI/CD repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/cicd
+          ref: ${{ inputs.cicd_ref }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Write resolved config
+        run: |
+          cat <<'EOF' > terraform/resolved.auto.tfvars.json
+          ${{ needs.validate.outputs.resolved_config }}
+          EOF
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="prefix=${{ needs.validate.outputs.service_name }}/${{ inputs.environment }}"
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: terraform/
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capture Terraform Outputs
+        id: tf_outputs
+        working-directory: terraform
+        run: |
+          echo "service_url=$(terraform output -raw service_url)" >> $GITHUB_OUTPUT
+          echo "resource_ids=$(terraform output -json resource_ids)" >> $GITHUB_OUTPUT
+
+    outputs:
+      service_url: ${{ steps.tf_outputs.outputs.service_url }}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Job 4: Deploy Application
+  # ═══════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: "Deploy Application"
+    runs-on: ubuntu-latest
+    needs: [validate, plan, apply]
+    # Run even if apply was skipped (plan showed no changes — infra is ready)
+    if: always() && needs.validate.result == 'success' && (needs.apply.result == 'success' || needs.apply.result == 'skipped')
+
+    steps:
+      - name: Checkout service repo
+        uses: actions/checkout@v4
+
+      - name: Checkout CI/CD repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/cicd
+          ref: ${{ inputs.cicd_ref }}
+          path: .cicd
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ── App Engine Deploy ──────────────────────────────────────────────
+      - name: Deploy to App Engine
+        if: needs.validate.outputs.platform == 'appengine'
+        run: |
+          CONFIG="${{ inputs.config_path }}"
+          SERVICE_ID=$(jq -r '.platform_config.service_id // .service.name' "$CONFIG")
+          PROJECT=$(echo '${{ needs.validate.outputs.resolved_config }}' | jq -r '.gcp_project_id')
+
+          # Generate app.yaml from config
+          cat > app.yaml <<APPYAML
+          runtime: ${{ needs.validate.outputs.runtime }}
+          service: ${SERVICE_ID}
+          instance_class: $(jq -r '.platform_config.instance_class // "F2"' "$CONFIG")
+
+          automatic_scaling:
+            min_idle_instances: $(jq -r '.platform_config.automatic_scaling.min_idle_instances // 1' "$CONFIG")
+            max_idle_instances: $(jq -r '.platform_config.automatic_scaling.max_idle_instances // "automatic"' "$CONFIG")
+            min_pending_latency: $(jq -r '.platform_config.automatic_scaling.min_pending_latency // "30ms"' "$CONFIG")
+            max_pending_latency: $(jq -r '.platform_config.automatic_scaling.max_pending_latency // "automatic"' "$CONFIG")
+
+          env_variables:
+          $(echo '${{ needs.validate.outputs.resolved_config }}' | jq -r '.env_variables | to_entries[] | "  \(.key): \"\(.value)\""')
+
+          liveness_check:
+            path: ${{ needs.validate.outputs.resolved_config && fromJson(needs.validate.outputs.resolved_config).health_check_path || '/health' }}
+          APPYAML
+
+          echo "Generated app.yaml:"
+          cat app.yaml
+
+          gcloud app deploy app.yaml \
+            --project="${PROJECT}" \
+            --quiet \
+            --promote \
+            --stop-previous-version
+
+      # ── Compute Engine Deploy ──────────────────────────────────────────
+      - name: Deploy to Compute Engine
+        if: needs.validate.outputs.platform == 'compute'
+        run: |
+          CONFIG="${{ inputs.config_path }}"
+          PROJECT=$(echo '${{ needs.validate.outputs.resolved_config }}' | jq -r '.gcp_project_id')
+          SERVICE_NAME=$(jq -r '.service.name' "$CONFIG")
+          ZONE=$(jq -r '.platform_config.zone // "${{ needs.validate.outputs.region }}-a"' "$CONFIG")
+          INSTANCE_NAME="${SERVICE_NAME}-${{ inputs.environment }}"
+          BUILD_CMD=$(jq -r '.build.build_command // "npm run build"' "$CONFIG")
+          ARTIFACT_PATH=$(jq -r '.build.artifact_path // "./dist"' "$CONFIG")
+
+          # Build the application
+          ${BUILD_CMD}
+
+          # Package and upload artifact to GCS
+          DEPLOY_BUCKET="${PROJECT}-${SERVICE_NAME}-deploy"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          ARTIFACT_NAME="${SERVICE_NAME}-${TIMESTAMP}.tar.gz"
+
+          tar -czf "${ARTIFACT_NAME}" -C "${ARTIFACT_PATH}" .
+          gsutil cp "${ARTIFACT_NAME}" "gs://${DEPLOY_BUCKET}/${ARTIFACT_NAME}"
+
+          # Trigger deployment on the VM
+          gcloud compute ssh "${INSTANCE_NAME}" \
+            --project="${PROJECT}" \
+            --zone="${ZONE}" \
+            --command="
+              gsutil cp gs://${DEPLOY_BUCKET}/${ARTIFACT_NAME} /tmp/${ARTIFACT_NAME}
+              sudo mkdir -p /opt/${SERVICE_NAME}
+              sudo tar -xzf /tmp/${ARTIFACT_NAME} -C /opt/${SERVICE_NAME}
+              sudo systemctl restart ${SERVICE_NAME} || true
+            "
+
+      # ── Compute MIG Deploy ────────────────────────────────────────────
+      - name: Deploy to Compute MIG
+        if: needs.validate.outputs.platform == 'compute-mig'
+        run: |
+          CONFIG="${{ inputs.config_path }}"
+          PROJECT=$(echo '${{ needs.validate.outputs.resolved_config }}' | jq -r '.gcp_project_id')
+          SERVICE_NAME=$(jq -r '.service.name' "$CONFIG")
+          REGION="${{ needs.validate.outputs.region }}"
+          MIG_NAME="${SERVICE_NAME}-${{ inputs.environment }}-mig"
+          BUILD_CMD=$(jq -r '.build.build_command // "npm run build"' "$CONFIG")
+          ARTIFACT_PATH=$(jq -r '.build.artifact_path // "./dist"' "$CONFIG")
+
+          # Build the application
+          ${BUILD_CMD}
+
+          # Upload artifact
+          DEPLOY_BUCKET="${PROJECT}-${SERVICE_NAME}-mig-deploy"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          ARTIFACT_NAME="${SERVICE_NAME}-${TIMESTAMP}.tar.gz"
+
+          tar -czf "${ARTIFACT_NAME}" -C "${ARTIFACT_PATH}" .
+          gsutil cp "${ARTIFACT_NAME}" "gs://${DEPLOY_BUCKET}/${ARTIFACT_NAME}"
+
+          # Set the latest artifact path in instance metadata
+          # The startup script on the instances reads this to pull the latest version
+          gsutil cp "gs://${DEPLOY_BUCKET}/${ARTIFACT_NAME}" "gs://${DEPLOY_BUCKET}/latest.tar.gz"
+
+          # Trigger a rolling restart of the MIG
+          gcloud compute instance-groups managed rolling-action restart "${MIG_NAME}" \
+            --project="${PROJECT}" \
+            --region="${REGION}" \
+            --max-surge=3 \
+            --max-unavailable=0
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Job 5: Post-Deploy Healthcheck
+  # ═══════════════════════════════════════════════════════════════════════════
+  healthcheck:
+    name: "Health Check"
+    runs-on: ubuntu-latest
+    needs: [validate, apply, deploy]
+    if: always() && needs.deploy.result == 'success'
+
+    steps:
+      - name: Checkout CI/CD repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/cicd
+          ref: ${{ inputs.cicd_ref }}
+
+      - name: Determine service URL
+        id: url
+        run: |
+          PLATFORM="${{ needs.validate.outputs.platform }}"
+          PROJECT=$(echo '${{ needs.validate.outputs.resolved_config }}' | jq -r '.gcp_project_id')
+          SERVICE="${{ needs.validate.outputs.service_name }}"
+
+          case "$PLATFORM" in
+            appengine)
+              URL="https://${SERVICE}-dot-${PROJECT}.appspot.com"
+              ;;
+            compute)
+              # For compute, we'd need the IP from Terraform outputs
+              URL="${{ needs.apply.outputs.service_url }}"
+              ;;
+            compute-mig)
+              URL="${{ needs.apply.outputs.service_url }}"
+              ;;
+          esac
+
+          echo "url=${URL}" >> $GITHUB_OUTPUT
+
+      - name: Run healthcheck
+        run: |
+          chmod +x scripts/post-deploy-healthcheck.sh
+          HEALTH_PATH=$(echo '${{ needs.validate.outputs.resolved_config }}' | jq -r '.health_check_path // "/health"')
+          ./scripts/post-deploy-healthcheck.sh "${{ steps.url.outputs.url }}" "${HEALTH_PATH}" 10
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Job 6: Deployment Summary
+  # ═══════════════════════════════════════════════════════════════════════════
+  summary:
+    name: "Deployment Summary"
+    runs-on: ubuntu-latest
+    needs: [validate, plan, apply, deploy, healthcheck]
+    if: always()
+
+    steps:
+      - name: Create summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## Deployment Summary
+
+          | Field | Value |
+          |-------|-------|
+          | **Service** | \`${{ needs.validate.outputs.service_name }}\` |
+          | **Team** | \`${{ needs.validate.outputs.team }}\` |
+          | **Platform** | \`${{ needs.validate.outputs.platform }}\` |
+          | **Environment** | \`${{ inputs.environment }}\` |
+          | **Project** | \`${{ needs.validate.outputs.gcp_project_id }}\` |
+          | **Region** | \`${{ needs.validate.outputs.region }}\` |
+
+          ### Job Results
+
+          | Job | Status |
+          |-----|--------|
+          | Validate | ${{ needs.validate.result }} |
+          | Plan | ${{ needs.plan.result }} |
+          | Apply | ${{ needs.apply.result }} |
+          | Deploy | ${{ needs.deploy.result }} |
+          | Healthcheck | ${{ needs.healthcheck.result }} |
+
+          ---
+          *Deployed at $(date -u +'%Y-%m-%d %H:%M:%S UTC')*
+          EOF

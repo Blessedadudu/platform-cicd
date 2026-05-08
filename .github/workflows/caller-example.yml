@@ -1,0 +1,41 @@
+################################################################################
+# caller-example.yml — Example Caller Workflow
+#
+# HOW TO USE:
+#   1. Copy this file into YOUR service repository at .github/workflows/deploy.yml
+#   2. Ensure you have a deploy.json in your repo root
+#   3. Configure the required secrets in your repo/org settings
+#   4. Push to main (staging) or tag a release (production)
+#
+# This is the ONLY file a service team needs to add to their repo.
+# The entire deployment logic lives in the reusable workflow.
+################################################################################
+
+name: "Deploy"
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+jobs:
+  # ── Staging: Auto-deploy on push to main ───────────────────────────────
+  deploy-staging:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: YOUR_ORG/cicd/.github/workflows/deploy.yml@main
+    with:
+      config_path: "./deploy.json"
+      environment: "staging"
+      auto_approve: true
+    secrets: inherit
+
+  # ── Production: Deploy on release publish ──────────────────────────────
+  deploy-production:
+    if: github.event_name == 'release'
+    uses: YOUR_ORG/cicd/.github/workflows/deploy.yml@main
+    with:
+      config_path: "./deploy.json"
+      environment: "production"
+      auto_approve: false  # Production always requires manual approval
+    secrets: inherit

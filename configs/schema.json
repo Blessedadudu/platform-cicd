@@ -1,0 +1,153 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://org.internal/cicd/deploy-config-schema.json",
+  "title": "Deployment Configuration",
+  "description": "Schema for the config-driven CI/CD pipeline deploy.json file. This schema validates the deployment configuration before it reaches Terraform, catching misconfigurations early in the pipeline.",
+  "type": "object",
+  "required": ["service", "target", "environments", "build", "deploy"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference (optional, for IDE support)"
+    },
+    "service": {
+      "type": "object",
+      "description": "Service identity metadata",
+      "required": ["name", "team"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,61}[a-z0-9]$",
+          "description": "Unique service name. Lowercase alphanumeric with hyphens, 3-63 chars."
+        },
+        "team": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Owning team name (used for labelling and cost allocation)"
+        },
+        "repository": {
+          "type": "string",
+          "description": "GitHub repository in org/repo format"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "description": "Deployment target specification",
+      "required": ["platform", "gcp_project_id", "region"],
+      "additionalProperties": false,
+      "properties": {
+        "platform": {
+          "type": "string",
+          "enum": ["appengine", "compute", "compute-mig"],
+          "description": "Target platform for deployment"
+        },
+        "gcp_project_id": {
+          "type": "string",
+          "minLength": 6,
+          "description": "Default GCP project ID (can be overridden per environment)"
+        },
+        "region": {
+          "type": "string",
+          "description": "GCP region for resource deployment"
+        }
+      }
+    },
+    "environments": {
+      "type": "object",
+      "description": "Environment-specific overrides. Keys are environment names.",
+      "minProperties": 1,
+      "patternProperties": {
+        "^(staging|production)$": {
+          "type": "object",
+          "properties": {
+            "gcp_project_id": {
+              "type": "string",
+              "description": "Override the default GCP project for this environment"
+            },
+            "region": {
+              "type": "string",
+              "description": "Override the default region for this environment"
+            },
+            "variables": {
+              "type": "object",
+              "description": "Environment-specific variables",
+              "additionalProperties": { "type": "string" }
+            },
+            "requires_approval": {
+              "type": "boolean",
+              "default": false,
+              "description": "Whether deployment requires manual approval"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "build": {
+      "type": "object",
+      "description": "Build configuration",
+      "required": ["runtime"],
+      "additionalProperties": false,
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "description": "Application runtime (e.g., nodejs22, python312, go122)"
+        },
+        "build_command": {
+          "type": "string",
+          "default": "npm run build",
+          "description": "Command to build the application"
+        },
+        "artifact_path": {
+          "type": "string",
+          "default": "./dist",
+          "description": "Path to the build output directory"
+        },
+        "dockerfile": {
+          "type": "string",
+          "description": "Path to Dockerfile (if using container-based deployment)"
+        }
+      }
+    },
+    "deploy": {
+      "type": "object",
+      "description": "Deployment configuration",
+      "additionalProperties": false,
+      "properties": {
+        "health_check_path": {
+          "type": "string",
+          "default": "/health",
+          "description": "HTTP path for health checks"
+        },
+        "min_instances": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1,
+          "description": "Minimum number of instances"
+        },
+        "max_instances": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "Maximum number of instances"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 1800,
+          "default": 300,
+          "description": "Deployment timeout in seconds"
+        }
+      }
+    },
+    "platform_config": {
+      "type": "object",
+      "description": "Platform-specific configuration. Schema varies by target.platform value.",
+      "additionalProperties": true
+    }
+  }
+}

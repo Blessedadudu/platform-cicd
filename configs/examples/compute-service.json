@@ -1,0 +1,53 @@
+{
+  "$schema": "../schema.json",
+  "service": {
+    "name": "worker-service",
+    "team": "platform",
+    "repository": "org/worker-service"
+  },
+  "target": {
+    "platform": "compute",
+    "gcp_project_id": "myorg-staging",
+    "region": "us-central1"
+  },
+  "environments": {
+    "staging": {
+      "gcp_project_id": "myorg-staging",
+      "variables": {
+        "NODE_ENV": "staging",
+        "LOG_LEVEL": "debug"
+      }
+    },
+    "production": {
+      "gcp_project_id": "myorg-production",
+      "variables": {
+        "NODE_ENV": "production",
+        "LOG_LEVEL": "warn"
+      },
+      "requires_approval": true
+    }
+  },
+  "build": {
+    "runtime": "nodejs22",
+    "build_command": "npm run build",
+    "artifact_path": "./dist"
+  },
+  "deploy": {
+    "health_check_path": "/health",
+    "min_instances": 1,
+    "max_instances": 1,
+    "timeout_seconds": 600
+  },
+  "platform_config": {
+    "machine_type": "e2-medium",
+    "disk_size_gb": 30,
+    "disk_type": "pd-ssd",
+    "image_family": "ubuntu-2204-lts",
+    "image_project": "ubuntu-os-cloud",
+    "network": "default",
+    "subnet": "default",
+    "tags": ["http-server", "https-server"],
+    "enable_static_ip": true,
+    "service_port": 8080
+  }
+}
