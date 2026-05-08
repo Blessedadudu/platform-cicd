@@ -75,10 +75,20 @@ resource "google_project_service" "secretmanager" {
 # WHY `create-then-deploy`:
 #   This resource creates the App Engine application if it doesn't exist.
 #   App Engine is a singleton per GCP project — there can only be one.
-#   If it already exists, Terraform imports it into state.
 #
 # IMPORTANT: `location_id` CANNOT be changed after creation.
 # The region you set here is permanent for this project.
+#
+# IMPORT STRATEGY:
+#   If App Engine already exists in this project (common for shared/existing
+#   projects), Terraform would fail with a 409 "already exists" error.
+#   The `import` block tells Terraform to adopt the existing resource into
+#   state rather than trying to create it.
+
+import {
+  id = var.gcp_project_id
+  to = google_app_engine_application.app
+}
 
 resource "google_app_engine_application" "app" {
   project     = var.gcp_project_id
