@@ -376,9 +376,6 @@ jobs:
 
           env_variables:
           $(echo '${{ needs.validate.outputs.resolved_config }}' | jq -r '.env_variables | to_entries[] | "  \(.key): \"\(.value)\""')
-
-          liveness_check:
-            path: ${{ needs.validate.outputs.resolved_config && fromJson(needs.validate.outputs.resolved_config).health_check_path || '/health' }}
           APPYAML
 
           echo "Generated app.yaml:"
