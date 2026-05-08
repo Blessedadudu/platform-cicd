@@ -59,6 +59,12 @@ on:
         type: string
         default: "main"
 
+      cicd_repo:
+        description: "Name of the cicd repo (e.g. 'cicd' or 'platform-cicd')"
+        required: false
+        type: string
+        default: "platform-cicd"
+
     secrets:
       GCP_SA_KEY:
         description: "GCP Service Account JSON key (base64 encoded or raw JSON)"
@@ -102,7 +108,7 @@ jobs:
       - name: Checkout CI/CD repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/cicd
+          repository: ${{ github.repository_owner }}/${{ inputs.cicd_repo }}
           ref: ${{ inputs.cicd_ref }}
           path: .cicd
 
@@ -146,7 +152,7 @@ jobs:
       - name: Checkout CI/CD repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/cicd
+          repository: ${{ github.repository_owner }}/${{ inputs.cicd_repo }}
           ref: ${{ inputs.cicd_ref }}
 
       - name: Authenticate to GCP
@@ -255,7 +261,7 @@ jobs:
       - name: Checkout CI/CD repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/cicd
+          repository: ${{ github.repository_owner }}/${{ inputs.cicd_repo }}
           ref: ${{ inputs.cicd_ref }}
 
       - name: Authenticate to GCP
@@ -318,7 +324,7 @@ jobs:
       - name: Checkout CI/CD repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/cicd
+          repository: ${{ github.repository_owner }}/${{ inputs.cicd_repo }}
           ref: ${{ inputs.cicd_ref }}
           path: .cicd
 
@@ -447,7 +453,7 @@ jobs:
       - name: Checkout CI/CD repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/cicd
+          repository: ${{ github.repository_owner }}/${{ inputs.cicd_repo }}
           ref: ${{ inputs.cicd_ref }}
 
       - name: Determine service URL
